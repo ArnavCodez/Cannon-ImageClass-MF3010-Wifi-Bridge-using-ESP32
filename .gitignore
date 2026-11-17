@@ -1,0 +1,10 @@
+# real Wi-Fi credentials
+wifi_config.h
+
+build/
+*.o
+*.bin
+__pycache__/
+*.pyc
+.vscode/
+.DS_Store
