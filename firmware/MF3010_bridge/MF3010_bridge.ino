@@ -1,11 +1,17 @@
 /*
   MF3010 Wi-Fi bridge (ESP32-S3)
 
-  The Canon MF3010 only has USB. This sketch turns an ESP32-S3 into a USB host
-  for it and accepts print jobs over Wi-Fi on port 9100 (raw / JetDirect), so
-  any PC with the normal Canon driver can print to it through a TCP/IP port.
+  The Canon MF3010 only has USB and only understands Canon's own UFR II LT
+  language. This turns an ESP32-S3 into a USB host for it and makes it a normal
+  network printer:
+
+    phone / laptop -> Wi-Fi -> IPP (port 631) -> ESP32-S3 -> USB -> MF3010
+      Shows up as "Canon MF3010 Wi-Fi" on Android, iPhone, Windows and Mac
+      with no driver. The board converts the pages it gets (PWG / Apple
+      raster) into UFR II LT itself.
 
     PC (Canon driver) -> Wi-Fi -> port 9100 -> ESP32-S3 -> USB -> MF3010
+      Raw port, still there for PCs that have the Canon driver.
 
   Status page + log:  http://<board ip>  or  http://mf3010.local
   OTA update:         http://<board ip>/update
@@ -15,11 +21,13 @@
        blue           - Wi-Fi ok, no printer on USB
        green          - printer ready
        green blinking - printing
+       white blinking - "identify" pressed on a phone
 
   Arduino IDE settings (esp32 core 3.x): board "ESP32S3 Dev Module",
   USB CDC On Boot: Disabled, USB Mode: Hardware CDC and JTAG, PSRAM: Disabled,
   Flash Size: 4MB, Partition Scheme: Minimal SPIFFS (1.9MB APP with OTA).
   (CDC On Boot Enabled prints the IP on serial for 20 s before USB host starts.)
+  All the .h/.cpp files next to this one are part of the sketch.
 */
 
 #include <WiFi.h>
@@ -28,7 +36,11 @@
 #include <HTTPUpdateServer.h>
 #include <atomic>
 #include <stdarg.h>
+#include <time.h>
+#include <sys/time.h>
+#include <lwip/sockets.h>
 #include "esp_log.h"
+#include "mdns.h"
 #include "usb/usb_host.h"
 
 #if __has_include("wifi_config.h")
@@ -36,12 +48,17 @@
 #else
 #error "Copy wifi_config.example.h to wifi_config.h and put your Wi-Fi name and password in it"
 #endif
+#include "ipp.h"
 
-#define FW_VERSION "1.0"
+#define FW_VERSION "2.0"
 
 const char *HOST_NAME = "mf3010";
+const char *PRINTER_NAME = "Canon MF3010 Wi-Fi";
+const char *PRINTER_MODEL = "Canon imageCLASS MF3010";
 
 #define RAW_PORT 9100
+#define IPP_PORT 631
+#define IPP_MAX_CONN 3
 #define LED_PIN 48
 #define LED_LEVEL 20
 // bytes per USB transfer. 64 (one packet) also works, just slower
@@ -531,6 +548,9 @@ static void startUsbHost() {
 
 // ---------------------------------------------------------------- port 9100
 
+// one job at a time, whether it comes from port 9100 or IPP
+static SemaphoreHandle_t printerLock;
+
 static WiFiServer rawServer(RAW_PORT);
 static uint8_t netBuf[USB_CHUNK];
 static std::atomic<bool> printing{ false };
@@ -544,6 +564,10 @@ static void handleJob(WiFiClient &c) {
     return;
   }
   String from = c.remoteIP().toString();
+  if (xSemaphoreTake(printerLock, 0) != pdTRUE) {
+    logMsg("Port 9100 job from %s waits: printer busy with a phone job", from.c_str());
+    xSemaphoreTake(printerLock, portMAX_DELAY);
+  }
   printing = true;
   uint32_t total = 0;
   uint32_t last = millis();
@@ -568,6 +592,7 @@ static void handleJob(WiFiClient &c) {
   }
   c.stop();
   printing = false;
+  xSemaphoreGive(printerLock);
   if (total == 0 && ok) return;
   jobCount++;
   lastJobBytes = total;
@@ -583,6 +608,222 @@ static void printTask(void *arg) {
       delay(20);
     }
   }
+}
+
+// ---------------------------------------------------------------- IPP (phones)
+
+static String ippHost, ippAdmin, ippUuid;
+static std::atomic<int> ippConns{ 0 };
+static volatile uint32_t identifyUntil = 0;
+
+// ufr_job writes lots of small pieces, batch them into full USB transfers
+static uint8_t wbuf[USB_CHUNK];
+static size_t wlen = 0;
+static bool wfail = false;
+
+static bool printerWrite(const uint8_t *d, size_t n, void *ctx) {
+  if (wfail) return false;
+  if (n == 0) {  // flush
+    if (wlen && !usbWrite(wbuf, wlen)) wfail = true;
+    wlen = 0;
+    return !wfail;
+  }
+  while (n) {
+    size_t k = USB_CHUNK - wlen;
+    if (k > n) k = n;
+    memcpy(wbuf + wlen, d, k);
+    wlen += k;
+    d += k;
+    n -= k;
+    if (wlen == USB_CHUNK) {
+      if (!usbWrite(wbuf, wlen)) {
+        wfail = true;
+        wlen = 0;
+        return false;
+      }
+      wlen = 0;
+    }
+  }
+  return true;
+}
+
+static bool ippAcquire(uint32_t ms) {
+  if (xSemaphoreTake(printerLock, pdMS_TO_TICKS(ms)) != pdTRUE) return false;
+  wlen = 0;
+  wfail = false;
+  printing = true;
+  return true;
+}
+
+static void ippRelease() {
+  printing = false;
+  wlen = 0;
+  xSemaphoreGive(printerLock);
+}
+
+static bool ippOnline() { return printerReady.load(); }
+static uint32_t ippUptime() { return millis() / 1000 + 1; }
+static uint32_t ippEpoch() {
+  time_t now = time(NULL);
+  return now > 1700000000 ? (uint32_t)now : 0;
+}
+static void ippTime8(uint8_t t[8]) {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  if (tv.tv_sec < 1700000000) {
+    memset(t, 0, 8);
+    return;
+  }
+  struct tm tm;
+  gmtime_r(&tv.tv_sec, &tm);
+  ufr_time8(t, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_wday, tm.tm_hour, tm.tm_min, tm.tm_sec,
+            (int)(tv.tv_usec / 1000));
+}
+static SemaphoreHandle_t ippTableLock;
+static void ippLockFn() { xSemaphoreTake(ippTableLock, portMAX_DELAY); }
+static void ippUnlockFn() { xSemaphoreGive(ippTableLock); }
+static void ippLog(const char *m) { logMsg("%s", m); }
+static void ippIdentify() {
+  identifyUntil = millis() + 6000;
+  logMsg("IPP: identify requested");
+}
+
+static int sockRead(void *ctx, uint8_t *buf, size_t n) {
+  int k = lwip_recv((int)(intptr_t)ctx, buf, n, 0);
+  return k > 0 ? k : 0;
+}
+
+static bool sockWrite(void *ctx, const uint8_t *buf, size_t n) {
+  int fd = (int)(intptr_t)ctx;
+  while (n) {
+    int k = lwip_send(fd, buf, n, 0);
+    if (k <= 0) return false;
+    buf += k;
+    n -= k;
+  }
+  return true;
+}
+
+static void setTimeouts(int fd, int secs) {
+  struct timeval tv;
+  tv.tv_sec = secs;
+  tv.tv_usec = 0;
+  lwip_setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  lwip_setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+static void ippConnTask(void *arg) {
+  int fd = (int)(intptr_t)arg;
+  setTimeouts(fd, 60);
+  ipp_conn_t c;
+  c.read = sockRead;
+  c.write = sockWrite;
+  c.ctx = arg;
+  ipp_serve(&c);
+  // give the client a moment to read the reply before closing
+  lwip_shutdown(fd, SHUT_WR);
+  setTimeouts(fd, 2);
+  uint8_t tmp[64];
+  while (lwip_recv(fd, tmp, sizeof(tmp), 0) > 0) {
+  }
+  lwip_close(fd);
+  ippConns--;
+  vTaskDelete(NULL);
+}
+
+static void ippListenTask(void *arg) {
+  int s = lwip_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  int one = 1;
+  lwip_setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  struct sockaddr_in a;
+  memset(&a, 0, sizeof(a));
+  a.sin_family = AF_INET;
+  a.sin_port = htons(IPP_PORT);
+  a.sin_addr.s_addr = htonl(INADDR_ANY);
+  if (s < 0 || lwip_bind(s, (struct sockaddr *)&a, sizeof(a)) != 0 || lwip_listen(s, 4) != 0) {
+    logMsg("IPP: could not open port %d", IPP_PORT);
+    vTaskDelete(NULL);
+    return;
+  }
+  logMsg("IPP: phones can print to ipp://%s/ipp/print", ippHost.c_str());
+  for (;;) {
+    int fd = lwip_accept(s, NULL, NULL);
+    if (fd < 0) {
+      delay(100);
+      continue;
+    }
+    while (ippConns.load() >= IPP_MAX_CONN) delay(20);
+    ippConns++;
+    if (xTaskCreatePinnedToCore(ippConnTask, "ipp", 12288, (void *)(intptr_t)fd, 1, NULL, 1) != pdPASS) {
+      ippConns--;
+      logMsg("IPP: out of memory for a connection");
+      lwip_close(fd);
+    }
+  }
+}
+
+static ipp_platform_t ippPlat;
+
+static void startIpp(const String &ip) {
+  ippTableLock = xSemaphoreCreateMutex();
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  char u[64];
+  snprintf(u, sizeof(u), "urn:uuid:4d463330-3130-4000-8000-%02x%02x%02x%02x%02x%02x", mac[0], mac[1], mac[2], mac[3],
+           mac[4], mac[5]);
+  ippUuid = u;
+  ippHost = ip;
+  ippAdmin = "http://" + ip + "/";
+  ippPlat.name = PRINTER_NAME;
+  ippPlat.make_model = PRINTER_MODEL;
+  ippPlat.location = "";
+  ippPlat.uuid = ippUuid.c_str();
+  ippPlat.host = ippHost.c_str();
+  ippPlat.job_host = "MF3010-BRIDGE";
+  ippPlat.admin_url = ippAdmin.c_str();
+  ippPlat.acquire = ippAcquire;
+  ippPlat.release = ippRelease;
+  ippPlat.write = printerWrite;
+  ippPlat.write_ctx = NULL;
+  ippPlat.online = ippOnline;
+  ippPlat.uptime = ippUptime;
+  ippPlat.epoch = ippEpoch;
+  ippPlat.time8 = ippTime8;
+  ippPlat.lock = ippLockFn;
+  ippPlat.unlock = ippUnlockFn;
+  ippPlat.log = ippLog;
+  ippPlat.identify = ippIdentify;
+  ipp_init(&ippPlat);
+  xTaskCreatePinnedToCore(ippListenTask, "ipp_listen", 4096, NULL, 2, NULL, 1);
+}
+
+// mDNS / Bonjour so phones and laptops find the printer on their own
+static void announce() {
+  MDNS.setInstanceName(PRINTER_NAME);
+  MDNS.addService("http", "tcp", 80);
+  MDNS.addService("ipp", "tcp", IPP_PORT);
+  String uuid = ippUuid.substring(9);
+  MDNS.addServiceTxt("ipp", "tcp", "txtvers", "1");
+  MDNS.addServiceTxt("ipp", "tcp", "qtotal", "1");
+  MDNS.addServiceTxt("ipp", "tcp", "rp", "ipp/print");
+  MDNS.addServiceTxt("ipp", "tcp", "ty", PRINTER_MODEL);
+  MDNS.addServiceTxt("ipp", "tcp", "product", "(Canon MF3010)");
+  MDNS.addServiceTxt("ipp", "tcp", "note", "");
+  MDNS.addServiceTxt("ipp", "tcp", "adminurl", ippAdmin.c_str());
+  MDNS.addServiceTxt("ipp", "tcp", "pdl", "application/octet-stream,image/pwg-raster,image/urf");
+  MDNS.addServiceTxt("ipp", "tcp", "URF", "V1.4,CP99,PQ4,RS300-600,SRGB24,W8");
+  MDNS.addServiceTxt("ipp", "tcp", "Color", "F");
+  MDNS.addServiceTxt("ipp", "tcp", "Duplex", "F");
+  MDNS.addServiceTxt("ipp", "tcp", "Copies", "T");
+  MDNS.addServiceTxt("ipp", "tcp", "kind", "document");
+  MDNS.addServiceTxt("ipp", "tcp", "PaperMax", "legal-A4");
+  MDNS.addServiceTxt("ipp", "tcp", "UUID", uuid.c_str());
+  MDNS.addServiceTxt("ipp", "tcp", "air", "none");
+  MDNS.addServiceTxt("ipp", "tcp", "usb_MFG", "Canon");
+  MDNS.addServiceTxt("ipp", "tcp", "usb_MDL", "MF3010");
+  // iOS only lists printers that have the _universal subtype
+  esp_err_t e = mdns_service_subtype_add_for_host(NULL, "_ipp", "_tcp", NULL, "_universal");
+  if (e != ESP_OK) logMsg("mDNS: AirPrint subtype failed (%s)", esp_err_to_name(e));
 }
 
 // ---------------------------------------------------------------- web page
@@ -615,7 +856,28 @@ static void pageRoot() {
   if (printerId[0]) h += "Printer ID: " + esc(String(printerId)) + "<br>";
   h += "State: ";
   h += printing.load() ? "printing" : "idle";
-  h += "<br>Jobs so far: " + String(jobCount) + ", last job " + String(lastJobBytes) + " bytes</p>";
+  h += "<br>Port 9100 jobs so far: " + String(jobCount) + ", last job " + String(lastJobBytes) + " bytes<br>";
+  h += "Phones / IPP: <b>" + esc(String(PRINTER_NAME)) + "</b> at ipp://" + ippHost + "/ipp/print<br>";
+  h += "Memory free: " + String(ESP.getFreeHeap() / 1024) + " KB";
+  if (ESP.getPsramSize()) h += ", PSRAM free: " + String(ESP.getFreePsram() / 1024) + " KB";
+  else h += " (PSRAM off)";
+  h += "</p>";
+  ipp_job_info_t jobs[8];
+  int nj = ipp_jobs(jobs, 8);
+  if (nj > 0) {
+    static const char *const st[] = { "", "", "", "waiting", "held", "printing", "stopped", "canceled", "failed", "done" };
+    h += "<table border=1 cellpadding=4 style='border-collapse:collapse;font-size:13px'>"
+         "<tr><th>#</th><th>Document</th><th>From</th><th>Pages</th><th>KB</th><th>State</th></tr>";
+    for (int k = 0; k < nj; k++) {
+      ipp_job_info_t &j = jobs[k];
+      h += "<tr><td>" + String(j.id) + "</td><td>" + esc(String(j.name)) + "</td><td>" + esc(String(j.user)) + "</td><td>"
+           + String((unsigned long)j.pages) + "</td><td>" + String((unsigned long)(j.bytes / 1024)) + "</td><td>"
+           + String(j.state >= 3 && j.state <= 9 ? st[j.state] : "?");
+      if (j.state == 8 || j.state == 7) h += " - " + esc(String(j.reason));
+      h += "</td></tr>";
+    }
+    h += "</table>";
+  }
   h += "<pre>" + esc(logText()) + "</pre>";
   h += "<p><a href='/update'>Update firmware</a> | <a href='/usbreset'>Reset USB port</a> | "
        "<a href='/reboot'>Reboot</a></p></body></html>";
@@ -653,6 +915,7 @@ void setup() {
   Serial.begin(115200);
   logLock = xSemaphoreCreateMutex();
   outDone = xSemaphoreCreateBinary();
+  printerLock = xSemaphoreCreateMutex();
   esp_log_set_vprintf(idfLogHook);
   esp_log_level_set("*", ESP_LOG_WARN);
   esp_log_level_set("ENUM", ESP_LOG_DEBUG);
@@ -699,8 +962,12 @@ void setup() {
   logMsg("Wi-Fi: connected, IP address %s", ip.c_str());
   led(0, 0, LED_LEVEL);
 
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+  startIpp(ip);
   if (MDNS.begin(HOST_NAME)) {
-    MDNS.addService("http", "tcp", 80);
+    announce();
+  } else {
+    logMsg("mDNS: failed to start, phones may not find the printer by name");
   }
 
   updater.setup(&web);
@@ -734,6 +1001,12 @@ void setup() {
 void loop() {
   web.handleClient();
 
+  static uint32_t lastPoll = 0;
+  if (millis() - lastPoll > 2000) {
+    lastPoll = millis();
+    ipp_poll();
+  }
+
   static uint32_t lastLed = 0;
   static bool blink = false;
   if (millis() - lastLed > 400) {
@@ -741,6 +1014,8 @@ void loop() {
     blink = !blink;
     if (WiFi.status() != WL_CONNECTED) {
       led(blink ? LED_LEVEL : 0, 0, 0);
+    } else if ((int32_t)(identifyUntil - millis()) > 0) {
+      led(blink ? LED_LEVEL : 0, blink ? LED_LEVEL : 0, blink ? LED_LEVEL : 0);
     } else if (printing) {
       led(0, blink ? LED_LEVEL : 0, 0);
     } else if (printerReady) {
